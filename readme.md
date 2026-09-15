@@ -1,128 +1,84 @@
-# Lab 2: Global Error Handling
+# Lab 2: FinanceApi Global Error Handling
 
-- Duration: ~1 hour
-- Context: You are consultants working with a financial services company that needs consistent and secure error responses from their Web API. Right now, when something goes wrong, the API leaks messy stack traces or inconsistent messages to clients. Your task is to implement global error handling middleware that standardizes how errors are reported.
-
----
-
-#### Learning Objectives
-
-By the end of this lab, you will be able to:
-
-* Author custom exception handling middleware that intercepts unhandled exceptions early in the request pipeline.
-* Standardize error responses by returning a consistent JSON error model and appropriate HTTP status codes.
-* Create custom exception types (e.g., `NotFoundException`, `ValidationException`) to represent predictable, domain-specific error conditions.
-* Map custom exception types to specific HTTP status codes while treating unknown exceptions as generic 500 Internal Server Errors.
-* Adhere to standardized error response formats, such as RFC 7807 Problem Details, to provide machine-readable error information to API clients.
-
----
-
-#### Starter Project
-
-You are given a simple ASP.NET Core Web API project with one controller:
-
-```
-/FinanceApi
-  /Controllers
-    AccountsController.cs     // Contains dummy endpoints
-  /Middleware
-    ErrorHandlingMiddleware.cs // TODO: implement
-  Program.cs                  // Minimal setup + Swagger
-  README.md
+```bash
+dotnet run
 ```
 
-The `AccountsController` has endpoints that throw exceptions (`NotImplementedException`, `KeyNotFoundException`) to simulate failures.
+Swagger UI opens at `/swagger` (see `launchUrl` in `Properties/launchSettings.json`).
 
-Note: Ensure the project has a `Properties/launchSettings.json` file configured for Development mode to enable Swagger UI.
+## Endpoints
 
----
+All in `Controllers/AccountsController.cs`.
 
-#### Tasks
+* `GET /api/accounts`: 200
+* `GET /api/accounts/error`: throws `NotImplementedException`, 500
+* `GET /api/accounts/notfound`: throws `KeyNotFoundException`, 500
+* `GET /api/accounts/invalid`: throws `ArgumentException`, 500
+* `GET /api/accounts/{id:int}`: throws `NotFoundException`, 404
+* `GET /api/accounts/validate`: throws `ValidationException` with a field error, 400
 
-#### 1. Test Current Error Behavior (5 min)
+## Error Handling
 
-Goal: See what happens when the API encounters errors without proper error handling.
+* Middleware: `Middleware/ErrorHandlingMiddleware.cs`, `InvokeAsync` wraps `_next(context)` in try/catch, delegates to `HandleExceptionAsync`
+* Registered first in the pipeline: `Program.cs`, `app.UseMiddleware<ErrorHandlingMiddleware>();`
+* Response format: `HandleExceptionAsync` builds a `ProblemDetails` with `Status`, `Title`, `Detail`, `Instance` (request path); `traceId` goes in `Extensions` since it isn't a standard RFC 7807 field; content type `application/problem+json`
+* Custom exception types: `Exceptions/NotFoundException.cs`, `Exceptions/ValidationException.cs`
+* Mapping, in `HandleExceptionAsync`:
 
-* Run the project and open Swagger UI
-* Try these endpoints that are designed to throw exceptions:
-  * `GET /api/accounts/error` - throws `NotImplementedException`
-  * `GET /api/accounts/notfound` - throws `KeyNotFoundException`
-  * `GET /api/accounts/invalid` - throws `ArgumentException`
-* Observe what happens:
-  * What response do you get? (Raw HTML error page? Stack trace?)
-  * What status code is returned?
-  * Is the error information useful for API consumers?
-  * What security issues might this expose?
+| Exception | Status |
+|---|---|
+| `NotFoundException` | 404 |
+| `ValidationException` | 400 |
+| anything else | 500 |
 
-Checkpoint: What problems do you see with the current error handling? Why is this problematic for a financial services API?
+* 500 responses use a fixed generic `Detail` string, not `exception.Message` — avoids leaking internal exception info to clients
 
----
+## Stretch: Structured Logging
 
-#### 2. Create Error Handling Middleware (20 min)
+* `Serilog.AspNetCore` 10.0.0, console sink, wired in `Program.cs` via `builder.Host.UseSerilog(...)`
+* `ErrorHandlingMiddleware.InvokeAsync` logs every caught exception with `_logger.LogError`, `TraceId` as a structured field — correlates a log line to the `traceId` in the response body
 
-* Implement a new class `ErrorHandlingMiddleware`.
-* Use `RequestDelegate` to intercept requests in `InvokeAsync`.
-* Wrap the pipeline in a `try/catch`.
-* Catch exceptions and return a JSON error response with:
+## Stretch: ValidationException Field Errors
 
-  * `status` (HTTP code)
-  * `title` (short message)
-  * `detail` (error description, safe for clients)
-  * `traceId` (from `HttpContext.TraceIdentifier`)
+* `Exceptions/ValidationException.cs`: constructor takes `IDictionary<string, string[]>`, exposed as `Errors`
+* `HandleExceptionAsync` adds them to `problemDetails.Extensions["errors"]` when present
+* Demo: `GET /api/accounts/validate`, sample `amount` field error
 
-👉 Hint: Look up “ASP.NET Core custom middleware error handling”.
+## Stretch: Swagger Example Responses
 
-Checkpoint: When you hit `/api/accounts/error`, you should get a JSON response instead of a raw stack trace.
+* `Swagger/ErrorResponseExamplesFilter.cs`: `IOperationFilter`, attaches a sample `ProblemDetails` body to any 400/404/500 response already declared via `[ProducesResponseType]`
+* Registered in `Program.cs`: `options.OperationFilter<ErrorResponseExamplesFilter>();`
+* `[ProducesResponseType]` attributes: `Controllers/AccountsController.cs`, class-level 500, per-action 404/400/200
 
----
+## Curl requests for Manual Tests
 
-#### 3. Standardize Error Format (15 min)
+```bash
+curl http://localhost:5001/api/accounts
 
-* Update the middleware to return Problem Details (RFC 7807) format.
-* Use the built-in `ProblemDetails` class.
-* Include at least: `status`, `title`, `detail`, and `instance` (the request path).
+curl -i http://localhost:5001/api/accounts/error
 
-👉 Hint: Search “ASP.NET Core ProblemDetails middleware example”.
+curl -i http://localhost:5001/api/accounts/notfound
 
-Checkpoint: Swagger should now show structured JSON errors for all unhandled exceptions.
+curl -i http://localhost:5001/api/accounts/invalid
 
----
+curl -i http://localhost:5001/api/accounts/999
 
-#### 4. Create Custom Exception Types (15 min)
+curl -i http://localhost:5001/api/accounts/validate
+```
 
-* Add `NotFoundException` and `ValidationException` classes under `/Exceptions`.
-* Throw `NotFoundException` from one dummy endpoint in `AccountsController`.
-* Update middleware to map:
+| Case | Result |
+|---|---|
+| GET all | 200 |
+| GET `error` | 500, generic `Detail`, `NotImplementedException` logged with `traceId` |
+| GET `notfound` | 500, `KeyNotFoundException` isn't mapped to a custom type, falls to the 500 branch |
+| GET `invalid` | 500, `ArgumentException` isn't mapped to a custom type, falls to the 500 branch |
+| GET `999` | 404, `NotFoundException`, `Detail` includes the id |
+| GET `validate` | 400, `ValidationException`, `errors.amount` in the body |
 
-  * `NotFoundException` → 404
-  * `ValidationException` → 400
-  * Any other exception → 500
+## Quick Reflection
 
-Checkpoint: Test endpoints and confirm status codes match expectations.
+**Why standardize error responses:** Clients parse one shape instead of branching on framework-specific stack-trace HTML, plain text, or ad-hoc JSON per endpoint. For a financial services API this also closes a security gap — before the middleware, unhandled exceptions returned raw `.NET` stack traces to the caller.
 
----
+**Custom exception vs. generic `Exception`:** A generic `Exception` carries no intent — the middleware can't tell a bug from an expected condition, so everything maps to 500. `NotFoundException` and `ValidationException` are thrown deliberately for conditions the API anticipates, so `HandleExceptionAsync` can map them to the right status code (404, 400) instead of defaulting to 500 for everything.
 
-#### 5. Reflection & PR (10 min)
-
-Create a pull request with your completed middleware and exception types. In the PR description, answer these reflection prompts:
-
-1. Why is it important to standardize error responses in a public-facing API?
-2. What’s the difference between a custom exception and a generic one (like `Exception`)?
-3. How does using Problem Details (RFC 7807) help API consumers?
-
----
-
-#### Stretch Goals
-
-* Add structured logging (e.g., Serilog) to log exception details with a `traceId`.
-* Add a `ValidationException` that includes a list of field errors in the `extensions` property of `ProblemDetails`.
-* Configure Swagger to show example error responses for endpoints.
-
----
-
-#### Deliverables
-
-* A working `ErrorHandlingMiddleware` registered in the pipeline.
-* Consistent JSON error responses using Problem Details.
-* Custom exception types with correct HTTP mappings.
-* A pull request with reflective answers.
+**How Problem Details helps consumers:** Fixed fields (`status`, `title`, `detail`, `instance`) mean a client writes one parser for every error the API returns, instead of one per endpoint. `application/problem+json` also lets HTTP-aware tooling (browsers, API clients) recognize it's an error body without parsing the payload first.
